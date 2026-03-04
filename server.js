@@ -2,6 +2,43 @@ const WebSocket = require('ws');
 const http = require('http');
 
 const PORT = 4000;
+
+// Binary protocol — event type IDs
+const EVT = {
+    SYNC: 1, TILT: 2,
+    MY_ID: 10, ERROR_MSG: 11, JOINED: 12, ROOM_UPDATE: 13,
+    LEFT_ROOM: 14, GAME_STARTED: 15, GAME_OVER: 16, ROOM_LIST: 17,
+    CREATE_ROOM: 20, JOIN_ROOM: 21, READY: 22, START_GAME: 23,
+    GET_ROOMS: 24, LEAVE_ROOM: 25,
+};
+const EVT_BY_NAME = Object.fromEntries(Object.entries(EVT).map(([k, v]) => [k.toLowerCase(), v]));
+const EVT_BY_ID = Object.fromEntries(Object.entries(EVT).map(([k, v]) => [v, k.toLowerCase()]));
+
+function packJson(evtId, data) {
+    if (data === undefined) return Buffer.from([evtId]);
+    const json = Buffer.from(JSON.stringify(data), 'utf8');
+    const buf = Buffer.alloc(1 + json.length);
+    buf[0] = evtId;
+    json.copy(buf, 1);
+    return buf;
+}
+
+function packSync(players, timeLeft) {
+    const entries = Object.entries(players);
+    const buf = Buffer.alloc(3 + entries.length * 16);
+    buf[0] = EVT.SYNC;
+    buf[1] = timeLeft;
+    buf[2] = entries.length;
+    let off = 3;
+    for (const [id, p] of entries) {
+        buf.writeUInt32LE(Number(id), off);
+        buf.writeFloatLE(p.x, off + 4);
+        buf.writeFloatLE(p.y, off + 8);
+        buf.writeFloatLE(p.score, off + 12);
+        off += 16;
+    }
+    return buf;
+}
 const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('WebSocket server is active.');
@@ -9,8 +46,8 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server });
 
 const ROOMS = {};
-const MAP_WIDTH = 1200;
-const MAP_HEIGHT = 1600;
+const MAP_WIDTH = 3000;
+const MAP_HEIGHT = 3000;
 const BALL_RADIUS = 10;
 const MAX_PLAYERS = 4;
 const COLORS = ['#F43F5E', '#38BDF8', '#10B981', '#F59E0B'];
@@ -54,24 +91,42 @@ wss.on('connection', (ws) => {
     const sendToRoom = (roomId, event, data) => {
         const room = ROOMS[roomId];
         if (!room) return;
+        const packed = event === 'sync'
+            ? packSync(data.players, data.timeLeft)
+            : packJson(EVT_BY_NAME[event], data);
         for (const pid in room.players) {
             const clientWs = room.players[pid].ws;
             if (clientWs.readyState === WebSocket.OPEN) {
-                clientWs.send(JSON.stringify({ event, data }));
+                clientWs.send(packed);
             }
         }
     };
 
     const sendToSelf = (event, data) => {
         if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ event, data }));
+            ws.send(packJson(EVT_BY_NAME[event], data));
         }
     };
 
-    ws.on('message', (messageStr) => {
+    ws.on('message', (message) => {
         try {
-            const parsed = JSON.parse(messageStr);
-            const { event, data } = parsed;
+            const buf = Buffer.isBuffer(message) ? message : Buffer.from(message);
+            const evtId = buf[0];
+
+            if (evtId === EVT.TILT) {
+                if (!currentRoom || !ROOMS[currentRoom]) return;
+                const room = ROOMS[currentRoom];
+                if (room.state === 'IN_GAME' && room.players[ws.id]) {
+                    room.players[ws.id].tilt = {
+                        x: buf.readFloatLE(1),
+                        y: buf.readFloatLE(5),
+                    };
+                }
+                return;
+            }
+
+            const event = EVT_BY_ID[evtId];
+            const data = buf.length > 1 ? JSON.parse(buf.slice(1).toString('utf8')) : undefined;
 
             if (event === 'create_room') {
                 const roomId = Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -122,13 +177,6 @@ wss.on('connection', (ws) => {
                     }
                 }
             }
-            else if (event === 'tilt') {
-                if (!currentRoom || !ROOMS[currentRoom]) return;
-                const room = ROOMS[currentRoom];
-                if (room.state === 'IN_GAME' && room.players[ws.id]) {
-                    room.players[ws.id].tilt = data;
-                }
-            }
             else if (event === 'get_rooms') {
                 const availableRooms = Object.values(ROOMS)
                     .filter(r => r.state === 'LOBBY' && Object.keys(r.players).length < MAX_PLAYERS)
@@ -141,7 +189,7 @@ wss.on('connection', (ws) => {
                 sendToSelf('left_room');
             }
         } catch (err) {
-            // ignore non-json
+            // ignore malformed messages
         }
     });
 
