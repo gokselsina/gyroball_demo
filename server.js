@@ -8,9 +8,9 @@ const EVT = {
     SYNC: 1, TILT: 2,
     MY_ID: 10, ERROR_MSG: 11, JOINED: 12, ROOM_UPDATE: 13,
     LEFT_ROOM: 14, GAME_STARTED: 15, GAME_OVER: 16, ROOM_LIST: 17,
-    ZONE_UPDATE: 18,
+    ZONE_UPDATE: 18, ULTI_UPDATE: 19,
     CREATE_ROOM: 20, JOIN_ROOM: 21, READY: 22, START_GAME: 23,
-    GET_ROOMS: 24, LEAVE_ROOM: 25,
+    GET_ROOMS: 24, LEAVE_ROOM: 25, FIRE_ULTI: 26, AIM_ULTI: 27,
 };
 const EVT_BY_NAME = Object.fromEntries(Object.entries(EVT).map(([k, v]) => [k.toLowerCase(), v]));
 const EVT_BY_ID = Object.fromEntries(Object.entries(EVT).map(([k, v]) => [v, k.toLowerCase()]));
@@ -50,6 +50,17 @@ const ROOMS = {};
 const BALL_RADIUS = 10;
 const MAX_PLAYERS = 4;
 const COLORS = ['#F43F5E', '#38BDF8', '#10B981', '#F59E0B'];
+
+const ULTI_COOLDOWN = 200; // 5s at 40Hz
+const PROJECTILE_SPEED = 12; // Faster sweep
+const PROJECTILE_RADIUS = 45; // Wide cone reach
+const PROJ_WALL_HITBOX = 8; // Small collision point for walls
+const ULTI_TYPES = {
+    shockwave: { maxDistance: 180, projectile: true },
+    freeze: { maxDistance: 200, projectile: true },
+    cage: { maxDistance: 160, projectile: true },
+    speedburst: { maxDistance: 180, projectile: false },
+};
 
 const GAME_MODES = {
     labyrinth: { name: 'Labirent', generate: () => generateLabyrinthMap() },
@@ -330,6 +341,10 @@ wss.on('connection', (ws) => {
                     players: {}, // id -> data
                     physicsLoop: null,
                     map: GAME_MODES[mode].generate(),
+                    projectiles: [], // For ultis
+                    cageWalls: [],   // For ultis
+                    nextProjId: 1,
+                    nextCageId: 1,
                 };
                 joinRoom(ws, roomId, data.nick);
             }
@@ -376,6 +391,76 @@ wss.on('connection', (ws) => {
                     .filter(r => r.state === 'LOBBY' && Object.keys(r.players).length < MAX_PLAYERS)
                     .map(r => ({ id: r.id, hostId: r.hostId, count: Object.keys(r.players).length }));
                 sendToSelf('room_list', availableRooms);
+            }
+            else if (event === 'fire_ulti') {
+                if (!currentRoom || !ROOMS[currentRoom]) return;
+                const room = ROOMS[currentRoom];
+                const player = room.players[ws.id];
+                if (room.state === 'IN_GAME' && player && player.ultiCooldown <= 0) {
+                    const ultiType = data.type; // e.g., 'FREEZE_BOMB', 'CAGE_TRAP'
+                    const ultiConfig = ULTI_TYPES[ultiType];
+                    const dirX = data.dx;
+                    const dirY = data.dy;
+
+                    if (ultiConfig) {
+                        player.activeAim = null; // Clear aim visually
+
+                        // Normalize direction
+                        const len = Math.sqrt(dirX * dirX + dirY * dirY);
+                        if (len > 0.01) {
+                            const nx = dirX / len;
+                            const ny = dirY / len;
+
+                            if (ultiType === 'speedburst') {
+                                player.vx += nx * 12;
+                                player.vy += ny * 12;
+                            } else {
+                                room.projectiles.push({
+                                    id: room.nextProjId++,
+                                    ownerId: ws.id,
+                                    ownerColor: player.color, // Add owner color for rendering
+                                    type: ultiType,
+                                    x: player.x,
+                                    y: player.y,
+                                    vx: nx * PROJECTILE_SPEED,
+                                    vy: ny * PROJECTILE_SPEED,
+                                    facingAngle: Math.atan2(ny, nx),
+                                    distanceTraveled: 0,
+                                    maxDistance: ultiConfig.maxDistance,
+                                });
+                            }
+                            player.ultiCooldown = ULTI_COOLDOWN;
+
+                            // Immediately broadcast ulti_update to prevent short-lived projectiles from being missed
+                            const activeAimsPacked = {};
+                            for (const pid in room.players) {
+                                if (room.players[pid].activeAim) {
+                                    activeAimsPacked[pid] = room.players[pid].activeAim;
+                                }
+                            }
+
+                            sendToRoom(currentRoom, 'ulti_update', {
+                                projectiles: room.projectiles.map(p => ({
+                                    id: p.id, type: p.type, x: p.x, y: p.y, radius: p.radius,
+                                    ownerColor: p.ownerColor, facingAngle: p.facingAngle
+                                })),
+                                cageWalls: room.cageWalls.map(c => ({
+                                    id: c.id, x: c.x, y: c.y, width: c.width, height: c.height
+                                })),
+                                cooldowns: Object.fromEntries(Object.entries(room.players).map(([k, v]) => [k, v.ultiCooldown])),
+                                activeAims: activeAimsPacked
+                            });
+                        }
+                    }
+                }
+            }
+            else if (event === 'aim_ulti') {
+                if (!currentRoom || !ROOMS[currentRoom]) return;
+                const room = ROOMS[currentRoom];
+                const player = room.players[ws.id];
+                if (room.state === 'IN_GAME' && player) {
+                    player.activeAim = data ? { type: data.type, dx: data.dx, dy: data.dy } : null;
+                }
             }
             else if (event === 'leave_room') {
                 handleDisconnect();
@@ -427,6 +512,8 @@ wss.on('connection', (ws) => {
             vx: 0,
             vy: 0,
             tilt: { x: 0, y: 0 },
+            ultiCooldown: 0,
+            frozenTicks: 0,
             isHost: room.hostId === wsReference.id
         };
 
@@ -471,10 +558,17 @@ function startGame(room, sendToRoomFunc) {
         room.players[pid].y = spawns[i % 4].y;
         room.players[pid].vx = 0;
         room.players[pid].vy = 0;
+        room.players[pid].tilt = { x: 0, y: 0 };
+        room.players[pid].ultiCooldown = 0;
+        room.players[pid].frozenTicks = 0;
         i++;
     }
 
     room.ticksLeft = 60 * 40; // 60 seconds at 40 Hz
+    room.projectiles = [];
+    room.cageWalls = [];
+    room.nextProjId = 1;
+    room.nextCageId = 1;
 
     // Initialize zone ownership state
     room.zoneStates = room.map.kingZones.map((kz, idx) => ({
@@ -535,6 +629,36 @@ function startGame(room, sendToRoomFunc) {
             })));
         }
 
+        // Broadcast ulti state every 2 ticks (~20Hz)
+        const hasProjectiles = room.projectiles.length > 0 || room.cageWalls.length > 0;
+        const hasAims = Object.values(room.players).some(p => p.activeAim);
+        const hasCooldowns = Object.values(room.players).some(p => p.ultiCooldown > 0);
+
+        const needsUltiUpdate = hasProjectiles || hasAims || hasCooldowns;
+
+        if (room.ticksLeft % 2 === 0 && (needsUltiUpdate || room.lastNeedsUltiUpdate)) {
+            const activeAimsPacked = {};
+            for (const pid in room.players) {
+                if (room.players[pid].activeAim) {
+                    activeAimsPacked[pid] = room.players[pid].activeAim;
+                }
+            }
+
+            sendToRoomFunc(room.id, 'ulti_update', {
+                projectiles: room.projectiles.map(p => ({
+                    id: p.id, type: p.type, x: p.x, y: p.y, radius: p.radius,
+                    ownerColor: p.ownerColor, facingAngle: p.facingAngle
+                })),
+                cageWalls: room.cageWalls.map(c => ({
+                    id: c.id, x: c.x, y: c.y, width: c.width, height: c.height
+                })),
+                cooldowns: Object.fromEntries(Object.entries(room.players).map(([k, v]) => [k, v.ultiCooldown])),
+                activeAims: activeAimsPacked
+            });
+
+            room.lastNeedsUltiUpdate = needsUltiUpdate;
+        }
+
         if (room.ticksLeft <= 0) {
             clearInterval(room.physicsLoop);
             room.state = 'LOBBY';
@@ -549,14 +673,28 @@ function startGame(room, sendToRoomFunc) {
 function updatePhysics(room) {
     const players = Object.values(room.players);
 
-    for (const p of players) {
-        // Apply tilt forces. Slower movement per request
-        const sensitivity = 0.6;
-        p.vx += p.tilt.x * sensitivity;
-        p.vy -= p.tilt.y * sensitivity; // Inverted y based on accel
+    const friction = room.gameMode === 'labyrinth' ? 1.0 : 0.98;
 
-        p.vx *= 0.98; // Slower movement => more friction
-        p.vy *= 0.98;
+    // Apply freeze and cooldown
+    for (const p of players) {
+        if (p.frozenTicks > 0) {
+            p.tilt = { x: 0, y: 0 }; // Disable tilt input
+            p.frozenTicks--;
+        }
+        if (p.ultiCooldown > 0) p.ultiCooldown--;
+    }
+
+    // Apply tilt
+    for (const p of players) {
+        // Only apply tilt if not frozen
+        if (p.frozenTicks <= 0) {
+            const sensitivity = 0.6;
+            p.vx += p.tilt.x * sensitivity;
+            p.vy -= p.tilt.y * sensitivity; // Inverted y based on accel
+        }
+
+        p.vx *= friction;
+        p.vy *= friction;
 
         p.x += p.vx;
         p.y += p.vy;
@@ -671,9 +809,78 @@ function updatePhysics(room) {
         }
     }
 
+    // Update Projectiles & Cage Walls
+    const toRemoveProj = [];
+    const activeWallsForProj = [...room.map.walls, ...room.cageWalls.map(c => ({ x: c.x, y: c.y, width: c.w, height: c.h }))];
+
+    for (const proj of room.projectiles) {
+        proj.x += proj.vx;
+        proj.y += proj.vy;
+        proj.distanceTraveled += PROJECTILE_SPEED;
+
+        if (proj.distanceTraveled >= proj.maxDistance) { toRemoveProj.push(proj.id); continue; }
+
+        let hitWall = false;
+        for (const wall of activeWallsForProj) {
+            const cx = clamp(proj.x, wall.x, wall.x + wall.width);
+            const cy = clamp(proj.y, wall.y, wall.y + wall.height);
+            const dx = proj.x - cx, dy = proj.y - cy;
+            if (dx * dx + dy * dy < PROJ_WALL_HITBOX * PROJ_WALL_HITBOX) { hitWall = true; break; }
+        }
+        if (hitWall) { toRemoveProj.push(proj.id); continue; }
+
+        for (const p of players) {
+            // Player whose ID matches the ownerId should not be hit
+            if (p === room.players[proj.ownerId]) continue;
+            const dx = p.x - proj.x, dy = p.y - proj.y;
+            const distSq = dx * dx + dy * dy;
+
+            // Cone collision: check distance AND angle
+            if (distSq < (BALL_RADIUS + PROJECTILE_RADIUS) ** 2) {
+                const angleToTarget = Math.atan2(dy, dx);
+                const angleDiff = Math.abs(angleToTarget - proj.facingAngle);
+
+                // Normalize angleDiff to [0, PI]
+                let normDiff = Math.atan2(Math.sin(angleDiff), Math.cos(angleDiff));
+                normDiff = Math.abs(normDiff);
+
+                if (normDiff <= Math.PI / 4) { // within 45 degrees of facing = 90 deg cone
+                    const dir = Math.sqrt(proj.vx * proj.vx + proj.vy * proj.vy);
+                    const nx = dir > 0 ? proj.vx / dir : 0;
+                    const ny = dir > 0 ? proj.vy / dir : 0;
+
+                    if (proj.type === 'shockwave') {
+                        p.vx += nx * 22; p.vy += ny * 22; // Stronger push
+                    } else if (proj.type === 'freeze') {
+                        p.frozenTicks = 80; p.vx = 0; p.vy = 0;
+                    } else if (proj.type === 'cage') {
+                        const cSize = 50, cx = p.x - 25, cy = p.y - 25;
+                        const cId = `cage_${room.nextProjId++}`;
+                        room.cageWalls.push(
+                            { id: cId + '_t', x: cx, y: cy, w: cSize, h: 6, ticksLeft: 200 },
+                            { id: cId + '_b', x: cx, y: cy + cSize - 6, w: cSize, h: 6, ticksLeft: 200 },
+                            { id: cId + '_l', x: cx, y: cy, w: 6, h: cSize, ticksLeft: 200 },
+                            { id: cId + '_r', x: cx + cSize - 6, y: cy, w: 6, h: cSize, ticksLeft: 200 }
+                        );
+                        p.vx = 0; p.vy = 0;
+                    }
+                    toRemoveProj.push(proj.id);
+                    break; // Hit one player
+                }
+            }
+        }
+    }
+    room.projectiles = room.projectiles.filter(p => !toRemoveProj.includes(p.id));
+
+    // Update cage walls TTL
+    for (const c of room.cageWalls) c.ticksLeft--;
+    room.cageWalls = room.cageWalls.filter(c => c.ticksLeft > 0);
+
     // Walls applied LAST so PvP bounces can't push someone inside a wall
+    const activeWalls = [...room.map.walls, ...room.cageWalls.map(c => ({ x: c.x, y: c.y, width: c.w, height: c.h }))];
+
     for (const p of players) {
-        for (const wall of room.map.walls) {
+        for (const wall of activeWalls) {
             const closestX = clamp(p.x, wall.x, wall.x + wall.width);
             const closestY = clamp(p.y, wall.y, wall.y + wall.height);
             const dx = p.x - closestX;
