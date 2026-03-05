@@ -8,6 +8,7 @@ const EVT = {
     SYNC: 1, TILT: 2,
     MY_ID: 10, ERROR_MSG: 11, JOINED: 12, ROOM_UPDATE: 13,
     LEFT_ROOM: 14, GAME_STARTED: 15, GAME_OVER: 16, ROOM_LIST: 17,
+    ZONE_UPDATE: 18,
     CREATE_ROOM: 20, JOIN_ROOM: 21, READY: 22, START_GAME: 23,
     GET_ROOMS: 24, LEAVE_ROOM: 25,
 };
@@ -50,12 +51,17 @@ const BALL_RADIUS = 10;
 const MAX_PLAYERS = 4;
 const COLORS = ['#F43F5E', '#38BDF8', '#10B981', '#F59E0B'];
 
-function generateMap() {
+const GAME_MODES = {
+    labyrinth: { name: 'Labirent', generate: () => generateLabyrinthMap() },
+    arena: { name: 'Arena', generate: () => generateArenaMap() },
+};
+
+function generateLabyrinthMap() {
     let MAP_WIDTH = 800;
     let MAP_HEIGHT = 600;
     let GRID_SIZE = 40;
 
-    let kingZone = { x: MAP_WIDTH / 2, y: MAP_HEIGHT / 2, radius: GRID_SIZE };
+    let kingZone = { x: MAP_WIDTH / 2, y: MAP_HEIGHT / 2, radius: GRID_SIZE, name: 'Kale' };
     let mazeWalls = [];
 
     function defaultFrameWalls() {
@@ -188,7 +194,78 @@ function generateMap() {
         width: MAP_WIDTH,
         height: MAP_HEIGHT,
         walls: [...defaultFrameWalls(), ...mazeWalls],
-        kingZone: kingZone
+        kingZones: [kingZone]
+    };
+}
+
+function generateArenaMap() {
+    const MAP_WIDTH = 800;
+    const MAP_HEIGHT = 600;
+
+    // Frame walls
+    const frameWalls = [
+        { id: '1', x: 0, y: 0, width: MAP_WIDTH, height: 40 },
+        { id: '2', x: 0, y: MAP_HEIGHT - 40, width: MAP_WIDTH, height: 40 },
+        { id: '3', x: 0, y: 0, width: 40, height: MAP_HEIGHT },
+        { id: '4', x: MAP_WIDTH - 40, y: 0, width: 40, height: MAP_HEIGHT },
+    ];
+
+    // Multiple king zones at strategic positions
+    const kingZones = [
+        { x: 200, y: 200, radius: 45, name: 'Kuzey' },
+        { x: 600, y: 400, radius: 45, name: 'Güney' },
+        { x: 400, y: 300, radius: 40, name: 'Merkez' },
+    ];
+
+    // Spawn corners to avoid (80px squares at each corner)
+    const spawnCorners = [
+        { x: 40, y: 40, w: 120, h: 120 },
+        { x: MAP_WIDTH - 160, y: 40, w: 120, h: 120 },
+        { x: 40, y: MAP_HEIGHT - 160, w: 120, h: 120 },
+        { x: MAP_WIDTH - 160, y: MAP_HEIGHT - 160, w: 120, h: 120 },
+    ];
+
+    function overlapsZone(wx, wy, ww, wh) {
+        // Check king zone overlap
+        for (const kz of kingZones) {
+            const closestX = clamp(kz.x, wx, wx + ww);
+            const closestY = clamp(kz.y, wy, wy + wh);
+            const dx = kz.x - closestX;
+            const dy = kz.y - closestY;
+            if (Math.sqrt(dx * dx + dy * dy) < kz.radius + 20) return true;
+        }
+        // Check spawn corner overlap
+        for (const sc of spawnCorners) {
+            if (wx < sc.x + sc.w && wx + ww > sc.x && wy < sc.y + sc.h && wy + wh > sc.y) return true;
+        }
+        return false;
+    }
+
+    // Generate random cover walls
+    const coverWalls = [];
+    let wallId = 5;
+    const numWalls = 15 + Math.floor(Math.random() * 11); // 15-25 walls
+    let attempts = 0;
+
+    while (coverWalls.length < numWalls && attempts < 200) {
+        attempts++;
+        // Random wall dimensions: mix of horizontal and vertical cover
+        const isHorizontal = Math.random() > 0.5;
+        const w = isHorizontal ? (60 + Math.floor(Math.random() * 80)) : 8;
+        const h = isHorizontal ? 8 : (60 + Math.floor(Math.random() * 80));
+        const x = 50 + Math.floor(Math.random() * (MAP_WIDTH - 100 - w));
+        const y = 50 + Math.floor(Math.random() * (MAP_HEIGHT - 100 - h));
+
+        if (!overlapsZone(x, y, w, h)) {
+            coverWalls.push({ id: (wallId++).toString(), x, y, width: w, height: h });
+        }
+    }
+
+    return {
+        width: MAP_WIDTH,
+        height: MAP_HEIGHT,
+        walls: [...frameWalls, ...coverWalls],
+        kingZones: kingZones
     };
 }
 
@@ -244,13 +321,15 @@ wss.on('connection', (ws) => {
 
             if (event === 'create_room') {
                 const roomId = Math.random().toString(36).substring(2, 8).toUpperCase();
+                const mode = (data.gameMode && GAME_MODES[data.gameMode]) ? data.gameMode : 'labyrinth';
                 ROOMS[roomId] = {
                     id: roomId,
                     hostId: ws.id,
                     state: 'LOBBY', // LOBBY or IN_GAME
+                    gameMode: mode,
                     players: {}, // id -> data
                     physicsLoop: null,
-                    map: generateMap(),
+                    map: GAME_MODES[mode].generate(),
                 };
                 joinRoom(ws, roomId, data.nick);
             }
@@ -362,6 +441,8 @@ function getRoomData(room) {
         id: room.id,
         hostId: room.hostId,
         state: room.state,
+        gameMode: room.gameMode,
+        gameModeName: GAME_MODES[room.gameMode]?.name || room.gameMode,
         players: Object.values(room.players).map(p => ({
             id: p.id,
             nick: p.nick,
@@ -395,11 +476,25 @@ function startGame(room, sendToRoomFunc) {
 
     room.ticksLeft = 60 * 40; // 60 seconds at 40 Hz
 
+    // Initialize zone ownership state
+    room.zoneStates = room.map.kingZones.map((kz, idx) => ({
+        id: idx,
+        name: kz.name || `Bölge ${idx + 1}`,
+        x: kz.x,
+        y: kz.y,
+        radius: kz.radius,
+        ownerId: null,     // player ID who owns this zone
+        ownerColor: null,
+        ownerNick: null,
+        captureProgress: {},  // { playerId: progress (0-100) }
+    }));
+
     sendToRoomFunc(room.id, 'game_started', {
         map_width: room.map.width,
         map_height: room.map.height,
         walls: room.map.walls,
-        king_zone: room.map.kingZone,
+        king_zones: room.map.kingZones,
+        game_mode: room.gameMode,
         ball_radius: BALL_RADIUS
     });
 
@@ -427,6 +522,18 @@ function startGame(room, sendToRoomFunc) {
         }
 
         sendToRoomFunc(room.id, 'sync', state);
+
+        // Broadcast zone ownership state every 10 ticks (~4Hz)
+        if (room.ticksLeft % 10 === 0 && room.zoneStates) {
+            sendToRoomFunc(room.id, 'zone_update', room.zoneStates.map(z => ({
+                id: z.id,
+                name: z.name,
+                ownerId: z.ownerId,
+                ownerColor: z.ownerColor,
+                ownerNick: z.ownerNick,
+                captureProgress: z.captureProgress,
+            })));
+        }
 
         if (room.ticksLeft <= 0) {
             clearInterval(room.physicsLoop);
@@ -498,12 +605,69 @@ function updatePhysics(room) {
         }
     }
 
-    // King Zone Score check logic
-    for (const p of players) {
-        const kDx = p.x - room.map.kingZone.x;
-        const kDy = p.y - room.map.kingZone.y;
-        if (Math.sqrt(kDx * kDx + kDy * kDy) < room.map.kingZone.radius) {
-            p.score += 100 / 40; // ~100 points per sec
+    // King Zone Ownership & Scoring logic
+    if (room.zoneStates) {
+        const CAPTURE_SPEED = 2.5; // progress per tick (100 = captured, ~1 sec)
+        const CAPTURE_DECAY = 1.0; // decay per tick when not in zone
+        const OWNER_SCORE_RATE = 50 / 40; // passive pts/sec for owning a zone
+        const CONTEST_SCORE_RATE = 100 / 40; // active pts/sec for being in own zone
+
+        for (const zone of room.zoneStates) {
+            // Find which players are inside this zone
+            const playersInZone = [];
+            for (const p of players) {
+                const kDx = p.x - zone.x;
+                const kDy = p.y - zone.y;
+                if (Math.sqrt(kDx * kDx + kDy * kDy) < zone.radius) {
+                    playersInZone.push(p);
+                }
+            }
+
+            // Update capture progress
+            for (const p of players) {
+                if (!zone.captureProgress[p.id]) zone.captureProgress[p.id] = 0;
+
+                if (playersInZone.includes(p)) {
+                    // Player is in zone: increase their capture progress
+                    // If someone else owns it, they need to neutralize first
+                    if (zone.ownerId && zone.ownerId !== p.id) {
+                        // Decrease owner's progress instead
+                        zone.captureProgress[zone.ownerId] = Math.max(0,
+                            (zone.captureProgress[zone.ownerId] || 0) - CAPTURE_SPEED);
+                        // If owner's progress hits 0, zone becomes neutral
+                        if (zone.captureProgress[zone.ownerId] <= 0) {
+                            zone.ownerId = null;
+                            zone.ownerColor = null;
+                            zone.ownerNick = null;
+                        }
+                    } else {
+                        // Capture / reinforce own zone
+                        zone.captureProgress[p.id] = Math.min(100,
+                            zone.captureProgress[p.id] + CAPTURE_SPEED);
+                    }
+
+                    // Check if captured
+                    if (!zone.ownerId && zone.captureProgress[p.id] >= 100) {
+                        zone.ownerId = p.id;
+                        zone.ownerColor = p.color;
+                        zone.ownerNick = p.nick;
+                    }
+                } else {
+                    // Player not in zone: slow decay (except owner keeps stable)
+                    if (p.id !== zone.ownerId) {
+                        zone.captureProgress[p.id] = Math.max(0,
+                            zone.captureProgress[p.id] - CAPTURE_DECAY);
+                    }
+                }
+            }
+
+            // Scoring: owner gets passive points, bonus if physically present
+            if (zone.ownerId && room.players[zone.ownerId]) {
+                room.players[zone.ownerId].score += OWNER_SCORE_RATE;
+                if (playersInZone.find(p => p.id === zone.ownerId)) {
+                    room.players[zone.ownerId].score += CONTEST_SCORE_RATE;
+                }
+            }
         }
     }
 
