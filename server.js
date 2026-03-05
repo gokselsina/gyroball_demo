@@ -59,7 +59,8 @@ const ULTI_TYPES = {
     shockwave: { maxDistance: 180, projectile: true },
     freeze: { maxDistance: 200, projectile: true },
     cage: { maxDistance: 160, projectile: true },
-    speedburst: { maxDistance: 180, projectile: false },
+    // speedburst: { maxDistance: 180, projectile: false },
+    vortex: { name: 'Kara Delik', icon: '🌀', color: '#6366F1', maxDistance: 250, projectile: true }
 };
 
 const GAME_MODES = {
@@ -566,6 +567,7 @@ function startGame(room, sendToRoomFunc) {
 
     room.ticksLeft = 180 * 40; // 180 seconds at 40 Hz
     room.projectiles = [];
+    room.vortexes = [];
     room.cageWalls = [];
     room.nextProjId = 1;
     room.nextCageId = 1;
@@ -651,6 +653,9 @@ function startGame(room, sendToRoomFunc) {
                 })),
                 cageWalls: room.cageWalls.map(c => ({
                     id: c.id, x: c.x, y: c.y, width: c.width, height: c.height
+                })),
+                vortexes: room.vortexes.map(v => ({
+                    id: v.id, x: v.x, y: v.y, r: v.currentRadius, color: v.color
                 })),
                 cooldowns: Object.fromEntries(Object.entries(room.players).map(([k, v]) => [k, v.ultiCooldown])),
                 activeAims: activeAimsPacked
@@ -815,8 +820,6 @@ function updatePhysics(room) {
         proj.y += proj.vy;
         proj.distanceTraveled += PROJECTILE_SPEED;
 
-        if (proj.distanceTraveled >= proj.maxDistance) { toRemoveProj.push(proj.id); continue; }
-
         let hitWall = false;
         for (const wall of activeWallsForProj) {
             const cx = clamp(proj.x, wall.x, wall.x + wall.width);
@@ -824,7 +827,23 @@ function updatePhysics(room) {
             const dx = proj.x - cx, dy = proj.y - cy;
             if (dx * dx + dy * dy < PROJ_WALL_HITBOX * PROJ_WALL_HITBOX) { hitWall = true; break; }
         }
-        if (hitWall) { toRemoveProj.push(proj.id); continue; }
+
+        if (hitWall || proj.distanceTraveled >= proj.maxDistance) {
+            if (proj.type === 'vortex') {
+                room.vortexes.push({
+                    id: `vortex_${room.nextProjId++}`,
+                    shooterId: proj.ownerId,
+                    x: proj.x,
+                    y: proj.y,
+                    currentRadius: 0,
+                    maxRadius: 80,
+                    ticksLeft: 140, // 3.5 seconds
+                    color: '#6366F1'
+                });
+            }
+            toRemoveProj.push(proj.id);
+            continue;
+        }
 
         for (const p of players) {
             // Player whose ID matches the ownerId should not be hit
@@ -860,6 +879,17 @@ function updatePhysics(room) {
                             { id: cId + '_r', x: cx + cSize - 6, y: cy, w: 6, h: cSize, ticksLeft: 200 }
                         );
                         p.vx = 0; p.vy = 0;
+                    } else if (proj.type === 'vortex') {
+                        room.vortexes.push({
+                            id: `vortex_${room.nextProjId++}`,
+                            shooterId: proj.ownerId,
+                            x: proj.x,
+                            y: proj.y,
+                            currentRadius: 0,
+                            maxRadius: 80,
+                            ticksLeft: 140,
+                            color: '#6366F1'
+                        });
                     }
                     toRemoveProj.push(proj.id);
                     break; // Hit one player
@@ -872,6 +902,31 @@ function updatePhysics(room) {
     // Update cage walls TTL
     for (const c of room.cageWalls) c.ticksLeft--;
     room.cageWalls = room.cageWalls.filter(c => c.ticksLeft > 0);
+
+    // Update Vortexes
+    for (const v of room.vortexes) {
+        v.ticksLeft--;
+        // Expand radius
+        if (v.currentRadius < v.maxRadius) v.currentRadius += 2;
+
+        for (const p of players) {
+            if (p.id === v.shooterId) continue; // Immunity for shooter
+
+            const dx = v.x - p.x;
+            const dy = v.y - p.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+
+            if (dist < v.currentRadius + 20) {
+                // Apply pull force
+                const force = 0.8 * (1 - dist / (v.currentRadius + 40));
+                const nx = dx / (dist || 1);
+                const ny = dy / (dist || 1);
+                p.vx += nx * force;
+                p.vy += ny * force;
+            }
+        }
+    }
+    room.vortexes = room.vortexes.filter(v => v.ticksLeft > 0);
 
     // Walls applied LAST so PvP bounces can't push someone inside a wall
     const activeWalls = [...room.map.walls, ...room.cageWalls.map(c => ({ x: c.x, y: c.y, width: c.w, height: c.h }))];
