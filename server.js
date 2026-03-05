@@ -46,37 +46,151 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server });
 
 const ROOMS = {};
-const MAP_WIDTH = 3000;
-const MAP_HEIGHT = 3000;
 const BALL_RADIUS = 10;
 const MAX_PLAYERS = 4;
 const COLORS = ['#F43F5E', '#38BDF8', '#10B981', '#F59E0B'];
 
-const WALLS = [
-    // Çerçeve (Sadece dış sınırlar)
-    { id: '1', x: 0, y: 0, width: MAP_WIDTH, height: 40 },
-    { id: '2', x: 0, y: MAP_HEIGHT - 40, width: MAP_WIDTH, height: 40 },
-    { id: '3', x: 0, y: 0, width: 40, height: MAP_HEIGHT },
-    { id: '4', x: MAP_WIDTH - 40, y: 0, width: 40, height: MAP_HEIGHT },
+function generateMap() {
+    let MAP_WIDTH = 800;
+    let MAP_HEIGHT = 600;
+    let GRID_SIZE = 40;
 
-    // İç Duvarlar ve Siperler
-    { id: '5', x: 250, y: 250, width: 200, height: 40 },
-    { id: '6', x: MAP_WIDTH - 450, y: 250, width: 200, height: 40 },
-    { id: '7', x: 250, y: MAP_HEIGHT - 290, width: 200, height: 40 },
-    { id: '8', x: MAP_WIDTH - 450, y: MAP_HEIGHT - 290, width: 200, height: 40 },
+    let kingZone = { x: MAP_WIDTH / 2, y: MAP_HEIGHT / 2, radius: GRID_SIZE };
+    let mazeWalls = [];
 
-    { id: '9', x: 350, y: 600, width: 40, height: 250 },
-    { id: '10', x: MAP_WIDTH - 390, y: 600, width: 40, height: 250 },
+    function defaultFrameWalls() {
+        return [
+            { id: '1', x: 0, y: 0, width: MAP_WIDTH, height: 40 },
+            { id: '2', x: 0, y: MAP_HEIGHT - 40, width: MAP_WIDTH, height: 40 },
+            { id: '3', x: 0, y: 0, width: 40, height: MAP_HEIGHT },
+            { id: '4', x: MAP_WIDTH - 40, y: 0, width: 40, height: MAP_HEIGHT },
+        ];
+    }
 
-    { id: '11', x: MAP_WIDTH / 2 - 150, y: 400, width: 300, height: 40 },
-    { id: '12', x: MAP_WIDTH / 2 - 150, y: MAP_HEIGHT - 440, width: 300, height: 40 },
-];
+    const cols = Math.floor(MAP_WIDTH / GRID_SIZE) - 2;
+    const rows = Math.floor(MAP_HEIGHT / GRID_SIZE) - 2;
+    const ENTRY_SIZE = 3;
 
-const KING_ZONE = {
-    x: MAP_WIDTH / 2,
-    y: MAP_HEIGHT / 2,
-    radius: 120
-};
+    let grid = new Array(cols);
+    for (let i = 0; i < cols; i++) {
+        grid[i] = new Array(rows);
+        for (let j = 0; j < rows; j++) {
+            grid[i][j] = {
+                x: i, y: j,
+                visited: false,
+                walls: { top: true, right: true, bottom: true, left: true }
+            };
+        }
+    }
+
+    let stack = [];
+    let startX = Math.floor(cols / 2);
+    let startY = Math.floor(rows / 2);
+    grid[startX][startY].visited = true;
+    stack.push(grid[startX][startY]);
+
+    function getNeighbor(nx, ny) {
+        if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) return null;
+        return grid[nx][ny];
+    }
+
+    while (stack.length > 0) {
+        let cell = stack[stack.length - 1];
+        let neighbors = [];
+
+        let t = getNeighbor(cell.x, cell.y - 1); if (t && !t.visited) neighbors.push({ cell: t, dir: 'top' });
+        let r = getNeighbor(cell.x + 1, cell.y); if (r && !r.visited) neighbors.push({ cell: r, dir: 'right' });
+        let b = getNeighbor(cell.x, cell.y + 1); if (b && !b.visited) neighbors.push({ cell: b, dir: 'bottom' });
+        let l = getNeighbor(cell.x - 1, cell.y); if (l && !l.visited) neighbors.push({ cell: l, dir: 'left' });
+
+        if (neighbors.length > 0) {
+            let n = neighbors[Math.floor(Math.random() * neighbors.length)];
+            if (n.dir === 'top') { cell.walls.top = false; n.cell.walls.bottom = false; }
+            if (n.dir === 'right') { cell.walls.right = false; n.cell.walls.left = false; }
+            if (n.dir === 'bottom') { cell.walls.bottom = false; n.cell.walls.top = false; }
+            if (n.dir === 'left') { cell.walls.left = false; n.cell.walls.right = false; }
+
+            n.cell.visited = true;
+            stack.push(n.cell);
+        } else {
+            stack.pop();
+        }
+    }
+
+    function carveRegion(sx, sy, w, h) {
+        for (let i = sx; i < sx + w; i++) {
+            for (let j = sy; j < sy + h; j++) {
+                let cell = getNeighbor(i, j);
+                if (!cell) continue;
+
+                let rightCell = getNeighbor(i + 1, j);
+                if (i < sx + w - 1 && rightCell) {
+                    cell.walls.right = false;
+                    rightCell.walls.left = false;
+                }
+                let bottomCell = getNeighbor(i, j + 1);
+                if (j < sy + h - 1 && bottomCell) {
+                    cell.walls.bottom = false;
+                    bottomCell.walls.top = false;
+                }
+            }
+        }
+    }
+
+    carveRegion(0, 0, ENTRY_SIZE, ENTRY_SIZE);
+    carveRegion(0, rows - ENTRY_SIZE, ENTRY_SIZE, ENTRY_SIZE);
+    carveRegion(cols - ENTRY_SIZE, 0, ENTRY_SIZE, ENTRY_SIZE);
+    carveRegion(cols - ENTRY_SIZE, rows - ENTRY_SIZE, ENTRY_SIZE, ENTRY_SIZE);
+
+    const kzSize = 4;
+    carveRegion(Math.floor(cols / 2) - kzSize / 2, Math.floor(rows / 2) - kzSize / 2, kzSize, kzSize);
+
+    let removalChance = 0.05;
+
+    if (removalChance > 0) {
+        for (let i = 1; i < cols - 1; i++) {
+            for (let j = 1; j < rows - 1; j++) {
+                if (Math.random() < removalChance) {
+                    let cell = grid[i][j];
+                    let dirs = [];
+                    if (cell.walls.top) dirs.push('top');
+                    if (cell.walls.right) dirs.push('right');
+                    if (cell.walls.bottom) dirs.push('bottom');
+                    if (cell.walls.left) dirs.push('left');
+
+                    if (dirs.length > 0) {
+                        let d = dirs[Math.floor(Math.random() * dirs.length)];
+                        if (d === 'top') { cell.walls.top = false; grid[i][j - 1].walls.bottom = false; }
+                        if (d === 'right') { cell.walls.right = false; grid[i + 1][j].walls.left = false; }
+                        if (d === 'bottom') { cell.walls.bottom = false; grid[i][j + 1].walls.top = false; }
+                        if (d === 'left') { cell.walls.left = false; grid[i - 1][j].walls.right = false; }
+                    }
+                }
+            }
+        }
+    }
+
+    let wallIdCounter = 5;
+    for (let i = 0; i < cols; i++) {
+        for (let j = 0; j < rows; j++) {
+            let cell = grid[i][j];
+            let px = (i + 1) * GRID_SIZE;
+            let py = (j + 1) * GRID_SIZE;
+
+            if (cell.walls.top) mazeWalls.push({ id: (wallIdCounter++).toString(), x: px, y: py, width: GRID_SIZE, height: 4 });
+            if (cell.walls.left) mazeWalls.push({ id: (wallIdCounter++).toString(), x: px, y: py, width: 4, height: GRID_SIZE });
+            if (j === rows - 1 && cell.walls.bottom) mazeWalls.push({ id: (wallIdCounter++).toString(), x: px, y: py + GRID_SIZE - 4, width: GRID_SIZE, height: 4 });
+            if (i === cols - 1 && cell.walls.right) mazeWalls.push({ id: (wallIdCounter++).toString(), x: px + GRID_SIZE - 4, y: py, width: 4, height: GRID_SIZE });
+        }
+    }
+
+    return {
+        width: MAP_WIDTH,
+        height: MAP_HEIGHT,
+        walls: [...defaultFrameWalls(), ...mazeWalls],
+        kingZone: kingZone
+    };
+}
 
 function clamp(val, min, max) {
     return Math.max(min, Math.min(max, val));
@@ -136,6 +250,7 @@ wss.on('connection', (ws) => {
                     state: 'LOBBY', // LOBBY or IN_GAME
                     players: {}, // id -> data
                     physicsLoop: null,
+                    map: generateMap(),
                 };
                 joinRoom(ws, roomId, data.nick);
             }
@@ -228,8 +343,8 @@ wss.on('connection', (ws) => {
             color: color,
             ready: room.hostId === wsReference.id ? true : false,
             score: 0,
-            x: MAP_WIDTH / 2 + (Math.random() * 200 - 100),
-            y: MAP_HEIGHT / 2 + (Math.random() * 200 - 100),
+            x: room.map.width / 2 + (Math.random() * 200 - 100),
+            y: room.map.height / 2 + (Math.random() * 200 - 100),
             vx: 0,
             vy: 0,
             tilt: { x: 0, y: 0 },
@@ -264,9 +379,9 @@ function startGame(room, sendToRoomFunc) {
     // Reset positions
     const spawns = [
         { x: 80, y: 80 },
-        { x: MAP_WIDTH - 80, y: 80 },
-        { x: 80, y: MAP_HEIGHT - 80 },
-        { x: MAP_WIDTH - 80, y: MAP_HEIGHT - 80 },
+        { x: room.map.width - 80, y: 80 },
+        { x: 80, y: room.map.height - 80 },
+        { x: room.map.width - 80, y: room.map.height - 80 },
     ];
     let i = 0;
     for (const pid in room.players) {
@@ -281,10 +396,10 @@ function startGame(room, sendToRoomFunc) {
     room.ticksLeft = 60 * 40; // 60 seconds at 40 Hz
 
     sendToRoomFunc(room.id, 'game_started', {
-        map_width: MAP_WIDTH,
-        map_height: MAP_HEIGHT,
-        walls: WALLS,
-        king_zone: KING_ZONE,
+        map_width: room.map.width,
+        map_height: room.map.height,
+        walls: room.map.walls,
+        king_zone: room.map.kingZone,
         ball_radius: BALL_RADIUS
     });
 
@@ -385,16 +500,16 @@ function updatePhysics(room) {
 
     // King Zone Score check logic
     for (const p of players) {
-        const kDx = p.x - KING_ZONE.x;
-        const kDy = p.y - KING_ZONE.y;
-        if (Math.sqrt(kDx * kDx + kDy * kDy) < KING_ZONE.radius) {
+        const kDx = p.x - room.map.kingZone.x;
+        const kDy = p.y - room.map.kingZone.y;
+        if (Math.sqrt(kDx * kDx + kDy * kDy) < room.map.kingZone.radius) {
             p.score += 100 / 40; // ~100 points per sec
         }
     }
 
     // Walls applied LAST so PvP bounces can't push someone inside a wall
     for (const p of players) {
-        for (const wall of WALLS) {
+        for (const wall of room.map.walls) {
             const closestX = clamp(p.x, wall.x, wall.x + wall.width);
             const closestY = clamp(p.y, wall.y, wall.y + wall.height);
             const dx = p.x - closestX;
