@@ -564,7 +564,7 @@ function startGame(room, sendToRoomFunc) {
         i++;
     }
 
-    room.ticksLeft = 60 * 40; // 60 seconds at 40 Hz
+    room.ticksLeft = 180 * 40; // 180 seconds at 40 Hz
     room.projectiles = [];
     room.cageWalls = [];
     room.nextProjId = 1;
@@ -695,9 +695,6 @@ function updatePhysics(room) {
 
         p.vx *= friction;
         p.vy *= friction;
-
-        p.x += p.vx;
-        p.y += p.vy;
     }
 
     // Player vs Player collisions
@@ -879,28 +876,34 @@ function updatePhysics(room) {
     // Walls applied LAST so PvP bounces can't push someone inside a wall
     const activeWalls = [...room.map.walls, ...room.cageWalls.map(c => ({ x: c.x, y: c.y, width: c.w, height: c.h }))];
 
-    for (const p of players) {
-        for (const wall of activeWalls) {
-            const closestX = clamp(p.x, wall.x, wall.x + wall.width);
-            const closestY = clamp(p.y, wall.y, wall.y + wall.height);
-            const dx = p.x - closestX;
-            const dy = p.y - closestY;
-            const distanceSq = dx * dx + dy * dy;
+    const SUBSTEPS = 4;
+    for (let s = 0; s < SUBSTEPS; s++) {
+        for (const p of players) {
+            p.x += p.vx / SUBSTEPS;
+            p.y += p.vy / SUBSTEPS;
 
-            if (distanceSq < BALL_RADIUS * BALL_RADIUS) {
-                const distance = Math.sqrt(distanceSq);
-                if (distance === 0) continue;
-                const overlap = BALL_RADIUS - distance;
-                const nx = dx / distance;
-                const ny = dy / distance;
+            for (const wall of activeWalls) {
+                const closestX = clamp(p.x, wall.x, wall.x + wall.width);
+                const closestY = clamp(p.y, wall.y, wall.y + wall.height);
+                const dx = p.x - closestX;
+                const dy = p.y - closestY;
+                const distanceSq = dx * dx + dy * dy;
 
-                p.x += nx * overlap;
-                p.y += ny * overlap;
+                if (distanceSq < BALL_RADIUS * BALL_RADIUS) {
+                    const distance = Math.sqrt(distanceSq);
+                    if (distance === 0) continue;
+                    const overlap = BALL_RADIUS - distance;
+                    const nx = dx / distance;
+                    const ny = dy / distance;
 
-                const dot = p.vx * nx + p.vy * ny;
-                const bounce = 0.5;
-                p.vx = (p.vx - (1 + bounce) * dot * nx) * 0.9;
-                p.vy = (p.vy - (1 + bounce) * dot * ny) * 0.9;
+                    p.x += nx * overlap;
+                    p.y += ny * overlap;
+
+                    const dot = p.vx * nx + p.vy * ny;
+                    const bounce = 0.5;
+                    p.vx = (p.vx - (1 + bounce) * dot * nx) * 0.9;
+                    p.vy = (p.vy - (1 + bounce) * dot * ny) * 0.9;
+                }
             }
         }
     }
